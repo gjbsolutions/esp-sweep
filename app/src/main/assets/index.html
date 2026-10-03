@@ -1,0 +1,290 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="dark"><title>ESP-SDR FFT Sweep</title>
+<style>
+:root{--bg:#11191e;--panel:#1b2429;--btn:#293135;--line:#394348;--muted:#a1adb2;--accent:#37c964;--bad:#ff8a80}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#dee2e6;font:15px/1.45 system-ui,"Segoe UI",Roboto,Arial,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:10px 12px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;flex:1;min-width:200px}.brand img{height:26px}h1{font-size:18px;margin:0}
+.conn{display:flex;align-items:center;gap:8px}#light{width:10px;height:10px;border-radius:50%;background:#555}#light.on{background:var(--accent)}
+button{background:var(--btn);color:#e8edf0;border:1px solid var(--line);border-radius:6px;padding:9px 14px;font:inherit;font-weight:600}button:disabled{opacity:.45}
+button.pri{background:#183b29;border-color:var(--accent);color:#e5ffed}
+main{max-width:1100px;margin:0 auto;padding:10px 12px}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+canvas{display:block;width:100%;height:340px;touch-action:none}#read{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 16px;padding:6px 10px 8px;border-top:1px solid #293135;font:12.5px/1.4 ui-monospace,Consolas,monospace;color:#8f9ca2}
+.bar{display:flex;gap:8px;margin:10px 0}.bar button{flex:1}
+#status{min-height:20px;font-size:13px;color:var(--muted);margin-bottom:6px}#status.err{color:var(--bad)}
+details{background:var(--panel);border:1px solid var(--line);border-radius:6px;margin-bottom:8px}summary{padding:10px 12px;font-weight:700;cursor:pointer}
+.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(135px,1fr));gap:8px 10px;padding:0 12px 12px}
+.g label{display:flex;flex-direction:column;font-size:12.5px;color:var(--muted);gap:3px}.g label.c{flex-direction:row;align-items:center;gap:8px;color:#dee2e6;font-size:14px}
+input,select{background:#11191e;color:#e8edf0;border:1px solid var(--line);border-radius:5px;padding:7px 8px;font:inherit;min-width:0;width:100%}input[type=checkbox]{width:auto}input:disabled,select:disabled{opacity:.5}
+</style></head><body>
+<header><div class="brand"><img src="espargos-logo.svg" alt="ESPARGOS"><h1>FFT Sweep</h1></div>
+<div class="conn"><span id="light"></span><span id="state">Not connected</span><button id="conn" class="pri">Connect</button><button id="demo">Demo</button></div></header>
+<main>
+<div class="chart"><canvas id="cv"></canvas><div id="read"><span id="rl"></span><span id="rr"></span></div></div>
+<div class="bar"><button id="go" class="pri" disabled>Start sweep</button><button id="rh">Reset hold</button><button id="csv">Share CSV</button></div>
+<div id="status">Connect the ESP-SDR, then press Start sweep.</div>
+<div id="cfg">
+<details open><summary>Sweep range</summary><div class="g">
+<label>Start (MHz)<input id="start" type="number" value="2400"></label><label>Stop (MHz)<input id="stop" type="number" value="2500"></label>
+<label>Window (MHz, even)<input id="window" type="number" step="2" value="20"></label><label>Step (MHz)<input id="step" type="number" value="20"></label>
+<label>Resolution (MHz)<select id="res"><option>0.25</option><option selected>0.5</option><option>1</option><option>2</option><option>5</option></select></label><label>DC blank (MHz)<input id="dc" type="number" step="0.25" value="1"></label>
+<label class="c"><input id="half" type="checkbox" checked>Step = window/2 (fills DC holes)</label></div></details>
+<details><summary>Radio</summary><div class="g">
+<label>Gain<select id="gmode"><option value="MANUAL">Manual</option><option value="HARDWARE">HW AGC</option></select></label><label>Manual gain index<input id="gain" type="number" value="40"></label>
+<label>Analog BW (MHz, 0 = max)<input id="bw" type="number" value="40"></label><label>FFT bins<select id="bins"><option>512</option></select></label></div></details>
+<details><summary>Speed</summary><div class="g">
+<label>Capture per window (ms)<input id="ms" type="number" value="20"></label><label>Settle after tune (ms)<input id="settle" type="number" value="2"></label>
+<label>Frames<select id="comb"><option value="max">Max over frames</option><option value="mean">Mean power</option></select></label></div></details>
+<details><summary>Display</summary><div class="g">
+<label class="c"><input id="repeat" type="checkbox" checked>Repeat continuously</label><label class="c"><input id="mirror" type="checkbox" checked>Mirror spectrum (if flipped)</label>
+<label class="c"><input id="showHold" type="checkbox" checked>Show max hold</label><label class="c"><input id="showCh" type="checkbox" checked>Show Wi-Fi channels</label>
+<label class="c"><input id="auto" type="checkbox" checked>Auto scale</label><label>Floor<input id="floor" type="number" value="0"></label><label>Ceil<input id="ceil" type="number" value="100"></label></div></details>
+</div></main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id),A=window.AndroidSerial,RATE=80e6,MAX_FAILS=6,BAUD=2000000;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const E=(m,t)=>Object.assign(Error(m),{t});            // t: D = retryable, S = SDR/protocol, N = no spectrum
+const enc=u=>{let s='';for(let i=0;i<u.length;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s)};
+const dec=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u};
+const CRC=(()=>{const t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[i]=c>>>0}return t})();
+const crc32=b=>{let c=-1;for(let i=0;i<b.length;i++)c=CRC[(c^b[i])&255]^(c>>>8);return(c^-1)>>>0};
+function log(t,err){const s=$('status');s.textContent=t;s.classList.toggle('err',!!err)}
+
+// ---------------- serial layer (native Android USB bridge) ----------------
+const ser=(()=>{
+ let buf=new Uint8Array(65536),rp=0,wp=0,waiter=null,closed=true,permCb=null;
+ const wait=ms=>new Promise(res=>{const t=setTimeout(()=>{waiter=null;res(false)},ms);waiter=v=>{clearTimeout(t);res(v)}});
+ function rx(u){
+  if(wp+u.length>buf.length){const n=wp-rp;if(n+u.length>buf.length){const nb=new Uint8Array(Math.max(buf.length*2,n+u.length));nb.set(buf.subarray(rp,wp));buf=nb}else buf.copyWithin(0,rp,wp);rp=0;wp=n}
+  buf.set(u,wp);wp+=u.length;if(waiter){const w=waiter;waiter=null;w(true)}}
+ const drain=()=>{rp=wp=0};
+ const write=s=>{const e=A.write(enc(new TextEncoder().encode(s)));if(e)throw E('Write failed: '+e,'D')};
+ async function more(dl){while(wp===rp){if(closed)throw E('Disconnected','D');const ms=dl-performance.now();if(ms<=0)throw E('timeout','D');await wait(ms)}const o=buf.slice(rp,wp);rp=wp=0;return o}
+ async function line(timeout=3000,max=256){
+  const dl=performance.now()+timeout;let k=0;
+  for(;;){
+   for(;rp+k<wp;k++){if(buf[rp+k]===10){const s=String.fromCharCode.apply(null,buf.subarray(rp,rp+k)).trim();rp+=k+1;return s}if(k>max){rp=wp;throw E('line too long, framing lost','D')}}
+   if(closed)throw E('Disconnected','D');const ms=dl-performance.now();if(ms<=0)throw E('timeout waiting for reply','D');await wait(ms)}}
+ async function cmd(t,prefix='',max=256){write(t+'\n');const r=await line(3000,max);if(r.startsWith('ERR')||!r.startsWith(prefix))throw E(`${t} -> ${r}`,'S');return r}
+ async function sync(){
+  for(let a=0;a<3;a++){
+   const m='SYNC '+Date.now(),target=m+'\n';let win='';drain();write('\n'+m+'\n');const end=performance.now()+2000;
+   while(performance.now()<end){let d;try{d=await more(end)}catch(e){break}
+    win=(win+String.fromCharCode.apply(null,d.length>20000?d.subarray(-20000):d)).slice(-(target.length+64));
+    if(win.includes(target)){drain();return}}}
+  throw E('SDR synchronization failed. Replug the board and close other SDR clients.','S')}
+ async function open(){
+  if(!A)throw Error('Android USB bridge missing.');
+  if(!A.hasDevice())throw Error('No USB serial device found. Use a USB-OTG cable. Seen: '+(A.devices()||'nothing'));
+  if(!A.hasPermitted())await new Promise((res,rej)=>{permCb={res,rej};A.request()});
+  const vid=(JSON.parse(A.info()).usbVendorId)||0,uart=[0x10c4,0x1a86,0x0403,0x067b].includes(vid);
+  let fail;
+  for(const rate of uart?[BAUD,1000000]:[BAUD]){
+   const e=A.open(rate);if(e){fail=Error(e);continue}
+   closed=false;drain();
+   try{if(uart){A.setSignals(0,1);await sleep(100);A.setSignals(0,0)}await sync();return}   // UART bridges: release EN/GPIO0
+   catch(x){fail=x;A.close();closed=true}}
+  throw fail}
+ function close(){try{if(!closed){write('RELEASE\n');}}catch(e){}closed=true;try{A.close()}catch(e){}}
+ window.__serialRx=s=>rx(dec(s));
+ window.__serialPerm=ok=>{const p=permCb;permCb=null;if(p)ok?p.res():p.rej(Error('USB permission denied'))};
+ window.__serialClosed=()=>{closed=true;if(waiter){const w=waiter;waiter=null;w(true)}onUsbLost()};
+ window.__serialEvent=()=>{};
+ return{open,close,sync,cmd,line,more,write,drain};
+})();
+
+// ---------------- device protocol (port of the desktop script) ----------------
+const dev={info:null,demo:false,demoFreq:2437,
+ async open(){
+  await ser.open();
+  const ident=await ser.cmd('INFO'),caps=(await ser.cmd('CAPS')).split(' ').slice(1);
+  if(!caps.includes('SPECCAPS'))throw E('This firmware does not advertise on-chip spectra (CAPS has no SPECCAPS).','S');
+  let gain=[0,79,1],bw=null,tune=[2412,2484];
+  if(caps.includes('RXLIMITS')){const l=JSON.parse((await ser.cmd('LIMITS?','LIMITS ',4096)).slice(7));gain=l.gain;bw=l.bandwidth||null}
+  if(caps.includes('TUNEEXT')){const h=(await ser.cmd('RANGE?','RANGE ')).split(' ');tune=[+h[1],+h[2]]}
+  const d=JSON.parse((await ser.cmd('SPECINFO?','SPECINFO',8192)).slice(8)),top=!!d.continuous;
+  const spec=(d.profiles||[]).map(p=>({rate:p[0],code:p[1],bins:p[2],stride:p[3],units:p[4],cont:p.length>5?!!p[5]:top}));
+  return this.info={identity:ident,gain,bw,tune,hwAgc:caps.includes('HWAGC'),spec}},
+ async configure(f,bw,gain){if(this.demo){this.demoFreq=f;return}await ser.cmd('FREQ '+f,'OK');if(this.info.bw)await ser.cmd('BANDWIDTH '+bw,'OK');await ser.cmd('GAIN '+gain,'OK')},
+ async retune(f){if(this.demo){this.demoFreq=f;return}await ser.cmd('FREQ '+f,'OK')},
+ async spec(prof,ms,mean){
+  const n=prof.bins;
+  if(this.demo)return this.fake(n,ms,mean);
+  const body=28+n,flen=body+4,mx=new Uint8Array(n),sum=new Float64Array(n);
+  let used=0,bad=0,empty=0,nz=false,lo=255,hi=0,junk=0;
+  ser.drain();ser.write(`SPEC ${ms} ${prof.stride} ${prof.units} 0 ${prof.code} ${n}\n`);
+  const r=await ser.line(3000);if(r.startsWith('ERR'))throw E(r,'S');
+  const p=r.split(' ');if(p.length<3||p[0]!=='SPEC'||+p[1]!==n)throw E('bad SPEC reply '+r.slice(0,50),'D');
+  const dl=performance.now()+ms+5000;let buf=new Uint8Array(0),ended=false;
+  while(!ended){
+   if(performance.now()>dl)throw E('SPEC stream timeout','D');
+   const m=await ser.more(Math.min(dl,performance.now()+2000)),j=new Uint8Array(buf.length+m.length);j.set(buf);j.set(m,buf.length);buf=j;
+   let at=0;
+   for(;;){
+    const rem=buf.length-at;if(rem<4)break;
+    if(buf[at]===83&&buf[at+1]===80&&buf[at+2]===67&&buf[at+3]===49){           // "SPC1" frame
+     if(rem<flen)break;
+     const fb=buf.subarray(at,at+flen);
+     if(new DataView(fb.buffer,fb.byteOffset,flen).getUint32(body,true)!==crc32(fb.subarray(0,body))||(1<<fb[26])!==n){bad++;at++;continue}
+     at+=flen;
+     if((fb[20]|(fb[21]<<8))===0){empty++;continue}
+     for(let i=0;i<n;i++){const c=fb[28+i];if(c>mx[i])mx[i]=c;if(mean)sum[i]+=10**(c/20);if(c){nz=true;if(c<lo)lo=c;if(c>hi)hi=c}}
+     used++;continue}
+    if(buf[at]===83&&buf[at+1]===80&&buf[at+2]===69&&buf[at+3]===67){            // "SPECEND ..." line
+     const nl=buf.indexOf(10,at);if(nl<0){if(rem>300){junk++;at++;continue}break}
+     const ln=String.fromCharCode.apply(null,buf.subarray(at,nl)).trim();
+     if(ln.startsWith('SPECEND')){const f=ln.split(' ');if(f[1]&&f[1]!=='0')throw E('SPECEND status '+f[1],'D');ended=true;at=nl+1;break}
+     junk++;at++;continue}
+    junk++;at++}                                                                // resync byte by byte
+   buf=buf.slice(at)}
+  if(!used)throw E(`no usable SPEC frames (bad CRC ${bad}, empty ${empty}): the firmware completed no FFT at this profile. If it is a 'continuous' one, pick a 'snapshot' FFT size`,'D');
+  const v=new Float32Array(n);for(let i=0;i<n;i++)v[i]=mean?10*Math.log10(sum[i]/used):mx[i]/2;
+  return{v,used,nz,lo,hi}},
+ async fake(n,ms,mean){
+  const half=n>>1,bm=RATE/n/1e6,v=new Float32Array(n),fr=Math.max(2,Math.floor(ms/4)),on=[0,0,0].map(()=>Array.from({length:fr},()=>Math.random()<.6));
+  for(let k=0;k<n;k++){const off=(k<half?k:k-n)*bm,f=this.demoFreq+off;let best=0;
+   for(let t=0;t<fr;t++){let db=30+(Math.random()-.5)*4-20*(Math.abs(off)/20)**4;[2412,2437,2462].forEach((fc,q)=>{if(on[q][t])db+=28/(1+(Math.abs(f-fc)/9)**8)});if(Math.abs(off)<.4)db+=18;if(db>best)best=db}
+   v[k]=Math.round(2*best)/2}
+  await sleep(ms*.5);return{v,used:fr,nz:true,lo:0,hi:200}}};
+
+// ---------------- helpers ----------------
+function fillGaps(y,maxgap){const idx=[];for(let i=0;i<y.length;i++)if(!isNaN(y[i]))idx.push(i);if(idx.length<2)return y;const o=Float32Array.from(y);
+ for(let k=0;k<idx.length-1;k++){const a=idx[k],b=idx[k+1];if(b-a>1&&b-a-1<=maxgap)for(let i=a+1;i<b;i++)o[i]=y[a]+(y[b]-y[a])*(i-a)/(b-a)}return o}
+const KEY='espSweepV2',num=id=>$(id).value.trim()===''?NaN:Number($(id).value),chk=id=>$(id).checked;
+let connected=false,running=false,stopping=false,stopFlag=false,resetHold=false,workerP=null,hover=null,raf=0;
+const S={freqs:[],disp:null,hold:null,start:2400,stop:2500,lims:null,info:''};
+
+// ---------------- config ----------------
+function readCfg(){
+ const info=dev.info,start=num('start'),stop=num('stop'),window_=num('window'),half=chk('half'),step=half?window_/2:num('step'),res=num('res'),dc=num('dc'),bw=num('bw'),ms=num('ms'),settle=num('settle'),bins=parseInt($('bins').value),gi=num('gain');
+ if([start,stop,window_,step,res,dc,bw,ms,settle,bins].some(isNaN))throw Error('Please enter valid numbers in all fields.');
+ const P=[],[lo,hi]=info.tune;
+ if(!(lo<=start&&start<stop&&stop<=hi))P.push(`Start/stop must satisfy ${lo} <= start < stop <= ${hi} MHz.`);
+ if(window_<4||window_%2)P.push('Window must be an even number of MHz (the SDR tunes in whole MHz).');
+ if(stop-start<window_)P.push('The sweep range must be at least one window wide.');
+ if(step<window_/2||step>window_)P.push(`Step must be between window/2 (${window_/2}) and the window (${window_}) MHz.`);
+ if(res<=0||res>window_)P.push('Resolution must be positive and not larger than the window.');
+ if(ms<2||settle<0)P.push('Capture time must be at least 2 ms.');
+ const r=info.bw;if(r&&bw!==0&&!(r[0]<=bw&&bw<=r[1]&&(bw-r[0])%r[2]===0))P.push(`Analog bandwidth must be 0 (widest) or ${r[0]} to ${r[1]} MHz.`);
+ const cand=info.spec.filter(p=>p.rate===RATE&&p.bins===bins);if(!cand.length)P.push('No 80 MS/s on-chip FFT profile with that many bins.');
+ let gain=null;const g=info.gain;
+ if($('gmode').value==='MANUAL'){if(!Number.isInteger(gi)||gi<g[0]||gi>g[1]||(gi-g[0])%g[2])P.push(`Manual gain index must be ${g[0]} to ${g[1]}.`);else gain='MANUAL '+gi}
+ else if(!info.hwAgc)P.push('This firmware has no hardware AGC; use manual gain.');else gain='HARDWARE';
+ if(P.length)throw Error(P.join(' '));
+ const prof=cand.slice().sort((a,b)=>a.cont-b.cont)[0],hw=window_/2,last=stop-hw,centers=[];
+ for(let c=start+hw;c<=last+1e-9;c+=step)centers.push(Math.round(c));
+ if(centers[centers.length-1]!==Math.round(last))centers.push(Math.round(last));
+ return{cfg:{start,stop,window:window_,res,dc,bw,ms,settle,gain,repeat:chk('repeat'),mirror:chk('mirror'),mean:$('comb').value==='mean',nb:Math.ceil((stop-start)/res-1e-9)},centers,prof}}
+
+// ---------------- sweep worker ----------------
+async function sweepWorker(cfg,centers,prof){
+ const n=prof.bins,half=n>>1,bm=RATE/n/1e6,nb=cfg.nb,res=cfg.res,start=cfg.start,sj=[],so=[];
+ for(let j=0;j<n;j++){const o=(j-half)*bm,a=Math.abs(o);if(a<cfg.window/2&&a>=cfg.dc){sj.push(((cfg.mirror?(n-j)%n:j)+half)%n);so.push(o)}}
+ const maxgap=Math.ceil(2*cfg.dc/res)+2,prev=new Float32Array(nb).fill(NaN),hold=new Float32Array(nb).fill(NaN);
+ let first=true,fails=0,sweeps=0,reason='stopped';
+ try{
+  while(!stopFlag){
+   const t0=performance.now(),cur=new Float32Array(nb).fill(NaN);let frames=0,rng=[0,0];
+   for(const c of centers){
+    if(stopFlag)break;
+    if(resetHold){resetHold=false;hold.fill(NaN)}
+    let r;
+    try{
+     if(first){await dev.configure(c,cfg.bw,cfg.gain);first=false}else await dev.retune(c);
+     if(cfg.settle)await sleep(cfg.settle);
+     r=await dev.spec(prof,cfg.ms,cfg.mean);
+     if(!r.nz)throw E(`The firmware returned ${n}-bin frames with every power code 0, i.e. no spectrum data. Choose another FFT size.`,'N');
+    }catch(e){
+     if(e.t!=='D'&&e.t!=='S')throw e;
+     fails++;log(`window ${c} MHz skipped: ${e.message}`,true);
+     if(fails>=MAX_FAILS)throw E(`aborted after ${fails} consecutive failures (${e.message})`,'S');
+     if(!dev.demo){try{await ser.sync()}catch(x){}first=true}
+     await sleep(50);continue}
+    fails=0;frames+=r.used;rng=[r.lo,r.hi];
+    const tmp=new Float32Array(nb).fill(NaN);
+    for(let k=0;k<sj.length;k++){const i=Math.floor((c+so[k]-start)/res);if(i>=0&&i<nb){const v=r.v[sj[k]];if(!(tmp[i]>=v))tmp[i]=v}}
+    const shown=new Float32Array(nb);
+    for(let i=0;i<nb;i++){const t=tmp[i];if(!isNaN(t)&&!(cur[i]>=t))cur[i]=t;const q=cur[i];if(!isNaN(q)&&!(hold[i]>=q))hold[i]=q;shown[i]=isNaN(q)?prev[i]:q}
+    S.disp=fillGaps(shown,maxgap);S.hold=fillGaps(hold,maxgap);schedule();
+    await sleep(0)}
+   if(stopFlag)break;
+   for(let i=0;i<nb;i++)if(!isNaN(cur[i]))prev[i]=cur[i];
+   sweeps++;const ms=performance.now()-t0;
+   S.info=`Sweep ${sweeps}: ${ms.toFixed(0)} ms (${(1000/Math.max(ms,1)).toFixed(1)}/s), ${frames} frames, codes ${rng[0]}..${rng[1]}`;log(S.info);schedule();
+   if(!cfg.repeat){reason='complete';break}}
+ }catch(e){reason='error';log('Sweep stopped: '+e.message,true)}
+ running=stopping=false;if(reason!=='error')log(reason==='complete'?'Sweep complete':'Stopped');setState();schedule()}
+
+// ---------------- drawing ----------------
+function schedule(){if(!raf)raf=requestAnimationFrame(()=>{raf=0;draw()})}
+function draw(){
+ const cv=$('cv'),d=Math.min(devicePixelRatio||1,2),W=Math.round(cv.clientWidth*d),H=Math.round(cv.clientHeight*d);
+ if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H}
+ const x=cv.getContext('2d'),l=46*d,r=10*d,t=12*d,b=30*d,pw=W-l-r,ph=H-t-b;
+ x.fillStyle='#11191e';x.fillRect(0,0,W,H);
+ const sp=Math.max(1,S.stop-S.start),X=m=>l+(m-S.start)/sp*pw,showHold=chk('showHold');
+ let ylo,yhi;
+ if(chk('auto')){let lo=1e9,hi=-1e9;for(const a of showHold?[S.disp,S.hold]:[S.disp])if(a)for(const v of a)if(v===v){if(v<lo)lo=v;if(v>hi)hi=v}
+  if(hi>lo){const c=S.lims;if(!c||lo<c[0]||hi>c[1]||hi-lo<.5*(c[1]-c[0]))S.lims=[lo-4,hi+4]}
+  [ylo,yhi]=S.lims||[0,100]}else{ylo=num('floor');yhi=num('ceil');if(!(yhi>ylo)){ylo=0;yhi=100}}
+ const Y=v=>t+(1-(v-ylo)/(yhi-ylo))*ph;
+ x.font=`${11*d}px ui-monospace,Consolas,monospace`;x.lineWidth=1;x.strokeStyle='#293135';x.fillStyle='#8f9ca2';x.textAlign='right';x.textBaseline='middle';
+ for(let i=0;i<=5;i++){const v=ylo+(yhi-ylo)*i/5,y=Y(v);x.beginPath();x.moveTo(l,y);x.lineTo(W-r,y);x.stroke();x.fillText(v.toFixed(0),l-5*d,y)}
+ const ts=[1,2,5,10,20,50,100,200,500].find(s=>sp/s<=8)||500;x.textAlign='center';x.textBaseline='top';
+ for(let m=Math.ceil(S.start/ts)*ts;m<=S.stop;m+=ts){const px=X(m);x.beginPath();x.moveTo(px,t);x.lineTo(px,t+ph);x.stroke();x.fillText(String(m),px,t+ph+4*d)}
+ if(chk('showCh')){x.strokeStyle='#33424a';x.fillStyle='#5d6c73';x.textBaseline='top';for(let c=1;c<=13;c++){const m=2407+5*c;if(m<S.start||m>S.stop)continue;const px=X(m);x.beginPath();x.moveTo(px,t);x.lineTo(px,t+ph);x.stroke();x.fillText(String(c),px,t+2*d)}}
+ x.save();x.beginPath();x.rect(l,t,pw,ph);x.clip();x.lineWidth=1.4*d;
+ const tr=(a,col)=>{if(!a)return;x.beginPath();x.strokeStyle=col;let on=false;for(let i=0;i<a.length;i++){if(a[i]!==a[i]){on=false;continue}const px=X(S.freqs[i]),py=Y(a[i]);on?x.lineTo(px,py):x.moveTo(px,py);on=true}x.stroke()};
+ if(showHold)tr(S.hold,'#7f8b91');tr(S.disp,'#4aa3ff');x.restore();x.strokeStyle='#394348';x.strokeRect(l,t,pw,ph);
+ let rl='';if(hover!==null&&S.disp){const i=Math.max(0,Math.min(S.freqs.length-1,Math.round((hover-S.start)/(sp/S.freqs.length)-.5))),v=S.disp[i],h=S.hold&&S.hold[i];
+  rl=`${S.freqs[i].toFixed(2)} MHz: ${v===v?v.toFixed(1):'n/a'}${h===h&&showHold?' (hold '+h.toFixed(1)+')':''}`}
+ $('rl').textContent=rl||'raw dB, uncalibrated';$('rr').textContent=S.info}
+$('cv').addEventListener('pointermove',e=>{const rc=$('cv').getBoundingClientRect(),px=(e.clientX-rc.left)/rc.width*$('cv').width,d=$('cv').width/rc.width*0+Math.min(devicePixelRatio||1,2);hover=S.start+(px-46*d)/($('cv').width-56*d)*(S.stop-S.start);schedule()});
+$('cv').addEventListener('pointerleave',()=>{hover=null;schedule()});addEventListener('resize',schedule);
+
+// ---------------- state / UI ----------------
+function setState(){
+ const can=connected&&!running;
+ for(const e of $('cfg').querySelectorAll('input,select'))e.disabled=!can;
+ $('step').disabled=!can||chk('half');
+ $('go').textContent=running?'Stop sweep':'Start sweep';$('go').disabled=!connected||stopping;
+ $('conn').textContent=connected?'Disconnect':'Connect';$('conn').disabled=running;$('demo').disabled=connected;
+ $('state').textContent=connected?(running?'Sweeping':'Connected'):'Not connected';$('light').classList.toggle('on',connected)}
+function save(){try{const o={};for(const e of $('cfg').querySelectorAll('input,select'))o[e.id]=e.type==='checkbox'?e.checked:e.value;localStorage.setItem(KEY,JSON.stringify(o))}catch(e){}}
+function load(){try{const o=JSON.parse(localStorage.getItem(KEY)||'null');if(o)for(const k in o){const e=$(k);if(e&&k!=='bins'){if(e.type==='checkbox')e.checked=o[k];else e.value=o[k]}}}catch(e){}}
+function applyInfo(info){
+ const[lo,hi]=info.tune;if(!(lo<=num('start')&&num('start')<num('stop')&&num('stop')<=hi)){$('start').value=Math.max(lo,2400);$('stop').value=Math.min(hi,2500)}
+ const best={};for(const p of info.spec)if(p.rate===RATE&&(!(p.bins in best)||(best[p.bins].cont&&!p.cont)))best[p.bins]=p;
+ const keys=Object.keys(best).map(Number).sort((a,b)=>a-b);$('bins').innerHTML=keys.map(b=>`<option value="${b}">${b} (${best[b].cont?'continuous':'snapshot'})</option>`).join('');
+ const pool=keys.filter(b=>!best[b].cont),pick=(pool.length?pool:keys).sort((a,b)=>Math.abs(a-512)-Math.abs(b-512))[0];
+ try{const o=JSON.parse(localStorage.getItem(KEY)||'null');if(o&&o.bins&&keys.includes(+o.bins))$('bins').value=o.bins;else if(pick)$('bins').value=pick}catch(e){if(pick)$('bins').value=pick}
+ if(!keys.length)log('Connected, but no 80 MS/s on-chip FFT profile is advertised.',true)}
+function onUsbLost(){if(connected){stopFlag=true;connected=false;dev.demo=false;log('USB device disconnected',true);setState()}}
+async function connect(demo){
+ $('conn').disabled=$('demo').disabled=true;log(demo?'Starting demo ...':'Connecting ...');
+ try{
+  if(demo){dev.demo=true;dev.info={identity:'DEMOSDR (simulated)',gain:[0,79,1],bw:[14,62,1,0],tune:[2100,2800],hwAgc:true,spec:[256,512,1024].map(b=>({rate:RATE,code:0,bins:b,stride:1,units:1,cont:false}))}}
+  else{dev.demo=false;await dev.open()}
+  applyInfo(dev.info);connected=true;stopFlag=false;if(!$('status').classList.contains('err'))log('Connected: '+dev.info.identity)
+ }catch(e){log('Connect failed: '+e.message,true);ser.close()}
+ setState()}
+async function disconnect(){stopFlag=true;if(workerP)await workerP.catch(()=>{});if(!dev.demo)ser.close();dev.demo=false;connected=false;log('Disconnected');setState()}
+$('conn').onclick=()=>connected?disconnect():connect(false);$('demo').onclick=()=>connect(true);
+$('go').onclick=()=>{
+ if(running){stopFlag=true;stopping=true;log('Stopping ...');setState();return}
+ let p;try{p=readCfg()}catch(e){return log(e.message,true)}
+ save();const{cfg,centers,prof}=p;
+ S.start=cfg.start;S.stop=cfg.stop;S.freqs=Float32Array.from({length:cfg.nb},(_,i)=>cfg.start+cfg.res*(i+.5));S.disp=new Float32Array(cfg.nb).fill(NaN);S.hold=new Float32Array(cfg.nb).fill(NaN);S.lims=null;S.info='';
+ stopFlag=false;stopping=false;running=true;
+ log(`Sweeping ${cfg.start}-${cfg.stop} MHz: ${centers.length} windows x ${cfg.window} MHz, ${prof.bins} bins (${prof.cont?'continuous':'snapshot'})${cfg.gain==='HARDWARE'?' - HW AGC: levels may step at the seams':''}`);
+ setState();workerP=sweepWorker(cfg,centers,prof)};
+$('rh').onclick=()=>{resetHold=true;if(S.hold)S.hold.fill(NaN);schedule()};
+$('csv').onclick=()=>{
+ if(!S.disp)return log('Run a sweep first.',true);
+ const rows=['freq_MHz,live_rawdB,maxhold_rawdB'];for(let i=0;i<S.freqs.length;i++)rows.push([S.freqs[i].toFixed(3),S.disp[i].toFixed(3),S.hold[i].toFixed(3)].join(',').replace(/NaN/g,'nan'));
+ if(A&&A.share)A.share('esp-sdr-sweep.csv',rows.join('\n'));else if(navigator.clipboard)navigator.clipboard.writeText(rows.join('\n')).then(()=>log('CSV copied to clipboard'))};
+$('half').onchange=setState;
+for(const e of $('cfg').querySelectorAll('input,select'))e.addEventListener('change',save);
+load();setState();schedule();
+</script></body></html>
